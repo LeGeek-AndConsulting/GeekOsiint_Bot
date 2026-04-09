@@ -1,7 +1,6 @@
 import { Telegraf } from 'telegraf';
 import { config } from 'dotenv';
 import axios from 'axios';
-import whois from 'whois-json';
 import dns from 'dns/promises';
 import { parsePhoneNumber, isValidPhoneNumber, getNumberType } from 'libphonenumber-js';
 
@@ -285,7 +284,9 @@ async function handleDomain(ctx, domain) {
   const msg = await loading(ctx, 'Analyse Du Domaine...');
 
   const [whoisRes, aRes, mxRes, nsRes, txtRes, crtRes] = await Promise.allSettled([
-    whois(domain),
+    axios.get(`https://api.whoisjsonapi.com/whoisserver/WhoisService?domainName=${domain}&outputFormat=json`, {
+      timeout: 8000, validateStatus: s => s < 500
+    }),
     dns.resolve4(domain).catch(() => []),
     dns.resolveMx(domain).catch(() => []),
     dns.resolveNs(domain).catch(() => []),
@@ -293,18 +294,18 @@ async function handleDomain(ctx, domain) {
     axios.get(`https://crt.sh/?q=%.${domain}&output=json`, { timeout: 8000 }).catch(() => null)
   ]);
 
-  const w = whoisRes.status === 'fulfilled' ? whoisRes.value : {};
+  const w = whoisRes.status === 'fulfilled' ? (whoisRes.value?.data?.WhoisRecord || {}) : {};
   const ips = aRes.value || [];
   const mx = mxRes.value || [];
   const ns = nsRes.value || [];
   const txt = txtRes.value || [];
   const crt = crtRes.status === 'fulfilled' && crtRes.value?.data;
 
-  const registrar = w.registrar || w.Registrar || '?';
-  const created = w.creationDate || w.createdDate || w['creation date'] || '?';
-  const expires = w.registrarRegistrationExpirationDate || w.expiresDate || w['expiry date'] || '?';
-  const registrant = w.registrantOrganization || w.registrantName || w['registrant name'] || '?';
-  const status = w.domainStatus || w['domain status'] || '?';
+  const registrar = w.registrarName || '?';
+  const created = w.createdDate || w.creationDate || '?';
+  const expires = w.expiresDate || w.expirationDate || '?';
+  const registrant = w.registrant?.organization || w.registrant?.name || '?';
+  const status = w.status || '?';
 
   let reply = `🌐 *Analyse Domaine*\n\`${esc(domain)}\`\n\n`;
 
