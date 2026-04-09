@@ -3,12 +3,9 @@ import { config } from 'dotenv';
 import axios from 'axios';
 import whois from 'whois-json';
 import dns from 'dns/promises';
-import libphonenumber from 'google-libphonenumber';
+import { parsePhoneNumber, isValidPhoneNumber, getNumberType } from 'libphonenumber-js';
 
 config();
-
-const { PhoneNumberUtil, PhoneNumberFormat } = libphonenumber;
-const phoneUtil = PhoneNumberUtil.getInstance();
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 
 // ─── SET BOT BIO & COMMANDS ──────────────────────────────────
@@ -379,40 +376,43 @@ async function handlePhone(ctx, phone) {
   const msg = await loading(ctx, 'Analyse Du Numéro...');
 
   try {
-    const parsed = phoneUtil.parse(phone);
-    const isValid = phoneUtil.isValidNumber(parsed);
-    const isPossible = phoneUtil.isPossibleNumber(parsed);
-    const country = phoneUtil.getRegionCodeForNumber(parsed);
-    const type = phoneUtil.getNumberType(parsed);
+    const parsed = parsePhoneNumber(phone);
+    if (!parsed) throw new Error('Invalid');
 
-    const typeNames = {
-      0: '📞 Fixe', 1: '📱 Mobile', 2: '📞📱 Fixe Ou Mobile',
-      3: '🆓 Numéro Gratuit', 4: '💰 Premium', 5: '📲 Partagé',
-      6: '🌐 VOIP', 7: '📟 Pager', 8: '🏢 UAN', 27: '❓ Inconnu'
+    const isValid = isValidPhoneNumber(phone);
+    const type = parsed.getType() || '❓ Inconnu';
+
+    const typeLabels = {
+      'MOBILE': '📱 Mobile',
+      'FIXED_LINE': '📞 Fixe',
+      'FIXED_LINE_OR_MOBILE': '📞📱 Fixe Ou Mobile',
+      'TOLL_FREE': '🆓 Numéro Gratuit',
+      'PREMIUM_RATE': '💰 Premium',
+      'VOIP': '🌐 VOIP',
+      'PAGER': '📟 Pager',
+      'SHARED_COST': '📲 Coût Partagé',
+      'UAN': '🏢 UAN',
     };
 
-    const intlFormat = phoneUtil.format(parsed, PhoneNumberFormat.INTERNATIONAL);
-    const natFormat = phoneUtil.format(parsed, PhoneNumberFormat.NATIONAL);
-    const e164Format = phoneUtil.format(parsed, PhoneNumberFormat.E164);
+    const intlFormat = parsed.formatInternational();
+    const natFormat = parsed.formatNational();
+    const e164Format = parsed.format('E.164');
+    const country = parsed.country;
+    const countryCode = parsed.countryCallingCode;
+    const nationalNum = parsed.nationalNumber;
 
-    const countryCode = parsed.getCountryCode();
-    const nationalNum = parsed.getNationalNumber();
-
-    // Lookup opérateur via numverify-style free check
+    // Lookup opérateur
     let carrierInfo = '';
     try {
       const numRes = await axios.get(
         `https://api.hlr-lookups.com/json/free/msisdn/${encodeURIComponent(e164Format.replace('+', ''))}`,
         { timeout: 5000, validateStatus: s => s < 500 }
       );
-      if (numRes.data?.operator) {
-        carrierInfo = numRes.data.operator;
-      }
+      if (numRes.data?.operator) carrierInfo = numRes.data.operator;
     } catch {}
 
     let reply = `📞 *Analyse Téléphone*\n\`${esc(phone)}\`\n\n`;
-
-    reply += `${isValid ? '✅' : '⚠️'} *Numéro ${isValid ? 'Valide' : isPossible ? 'Possible Mais Non Vérifié' : 'Invalide'}*\n\n`;
+    reply += `${isValid ? '✅' : '⚠️'} *Numéro ${isValid ? 'Valide' : 'Non Vérifié'}*\n\n`;
 
     reply += `📋 *Formats*\n`;
     reply += `┣ 🌐 International: \`${esc(intlFormat)}\`\n`;
@@ -423,15 +423,13 @@ async function handlePhone(ctx, phone) {
     reply += `┣ 🌍 Pays: ${countryFlag(country)} ${esc(country || '?')}\n`;
     reply += `┣ ☎️ Indicatif: \\+${esc(countryCode)}\n`;
     reply += `┣ 🔢 Numéro National: ${esc(nationalNum)}\n`;
-    reply += `┗ 📱 Type: ${esc(typeNames[type] || '❓ Inconnu')}\n`;
+    reply += `┗ 📱 Type: ${esc(typeLabels[type] || type)}\n`;
 
-    if (carrierInfo) {
-      reply += `\n🏢 *Opérateur*\n┗ ${esc(carrierInfo)}\n`;
-    }
+    if (carrierInfo) reply += `\n🏢 *Opérateur*\n┗ ${esc(carrierInfo)}\n`;
 
     await updateMsg(ctx, msg, reply);
 
-  } catch (err) {
+  } catch {
     await updateMsg(ctx, msg, `❌ Numéro Invalide\\. Utilise Le Format: \`\\+14385551234\``);
   }
 }
