@@ -391,6 +391,18 @@ async function handleDomain(ctx, domain) {
 // 📞 PHONE
 // ═══════════════════════════════════════════════════════════════
 
+// Fuseau horaire par pays (principaux)
+const COUNTRY_TZ = {
+  FR:'Europe/Paris', BE:'Europe/Brussels', CH:'Europe/Zurich', LU:'Europe/Luxembourg',
+  CA:'America/Toronto', US:'America/New_York', GB:'Europe/London', DE:'Europe/Berlin',
+  ES:'Europe/Madrid', IT:'Europe/Rome', PT:'Europe/Lisbon', NL:'Europe/Amsterdam',
+  MA:'Africa/Casablanca', DZ:'Africa/Algiers', TN:'Africa/Tunis', SN:'Africa/Dakar',
+  CM:'Africa/Douala', CI:"Africa/Abidjan", MG:'Indian/Antananarivo',
+  BR:'America/Sao_Paulo', MX:'America/Mexico_City', AR:'America/Argentina/Buenos_Aires',
+  JP:'Asia/Tokyo', CN:'Asia/Shanghai', IN:'Asia/Kolkata', AU:'Australia/Sydney',
+  RU:'Europe/Moscow', SA:'Asia/Riyadh', AE:'Asia/Dubai',
+};
+
 async function handlePhone(ctx, phone) {
   if (!phone) return ctx.reply('❌ Spécifie Un Numéro\\. Ex: `/phone \\+14385551234`', { parse_mode: 'MarkdownV2' });
 
@@ -401,7 +413,7 @@ async function handlePhone(ctx, phone) {
     if (!parsed) throw new Error('Invalid');
 
     const isValid = isValidPhoneNumber(phone);
-    const type = parsed.getType() || '❓ Inconnu';
+    const rawType = parsed.getType() || 'UNKNOWN';
 
     const typeLabels = {
       'MOBILE': '📱 Mobile',
@@ -413,40 +425,85 @@ async function handlePhone(ctx, phone) {
       'PAGER': '📟 Pager',
       'SHARED_COST': '📲 Coût Partagé',
       'UAN': '🏢 UAN',
+      'UNKNOWN': '❓ Inconnu',
     };
 
     const intlFormat = parsed.formatInternational();
-    const natFormat = parsed.formatNational();
+    const natFormat  = parsed.formatNational();
     const e164Format = parsed.format('E.164');
-    const country = parsed.country;
+    const country    = parsed.country;
     const countryCode = parsed.countryCallingCode;
     const nationalNum = parsed.nationalNumber;
+    const tz = COUNTRY_TZ[country] || null;
 
-    // Lookup opérateur
-    let carrierInfo = '';
-    try {
-      const numRes = await axios.get(
-        `https://api.hlr-lookups.com/json/free/msisdn/${encodeURIComponent(e164Format.replace('+', ''))}`,
-        { timeout: 5000, validateStatus: s => s < 500 }
-      );
-      if (numRes.data?.operator) carrierInfo = numRes.data.operator;
-    } catch {}
+    // Heure locale actuelle dans le pays
+    let localTime = '';
+    if (tz) {
+      localTime = new Intl.DateTimeFormat('fr-FR', {
+        timeZone: tz, hour: '2-digit', minute: '2-digit',
+        weekday: 'short', day: 'numeric', month: 'short'
+      }).format(new Date());
+    }
 
-    let reply = `📞 *Analyse Téléphone*\n\`${esc(phone)}\`\n\n`;
+    // AbstractAPI (optionnel)
+    let abstract = null;
+    if (process.env.ABSTRACT_API_PHONE_KEY) {
+      try {
+        const res = await axios.get('https://phonevalidation.abstractapi.com/v1/', {
+          params: { api_key: process.env.ABSTRACT_API_PHONE_KEY, phone: e164Format },
+          timeout: 6000, validateStatus: s => s < 500
+        });
+        if (res.data?.valid !== undefined) abstract = res.data;
+      } catch {}
+    }
+
+    // Fallback: hlr-lookups free
+    let carrierFallback = '';
+    if (!abstract) {
+      try {
+        const res = await axios.get(
+          `https://api.hlr-lookups.com/json/free/msisdn/${e164Format.replace('+', '')}`,
+          { timeout: 5000, validateStatus: s => s < 500 }
+        );
+        if (res.data?.operator) carrierFallback = res.data.operator;
+      } catch {}
+    }
+
+    // ── Réponse
+    let reply = `📞 *Analyse Téléphone*\n\`${esc(intlFormat)}\`\n\n`;
     reply += `${isValid ? '✅' : '⚠️'} *Numéro ${isValid ? 'Valide' : 'Non Vérifié'}*\n\n`;
 
     reply += `📋 *Formats*\n`;
     reply += `┣ 🌐 International: \`${esc(intlFormat)}\`\n`;
     reply += `┣ 🏠 National: \`${esc(natFormat)}\`\n`;
-    reply += `┗ 📟 E164: \`${esc(e164Format)}\`\n\n`;
+    reply += `┗ 📟 E\\.164: \`${esc(e164Format)}\`\n\n`;
 
     reply += `📡 *Informations*\n`;
     reply += `┣ 🌍 Pays: ${countryFlag(country)} ${esc(country || '?')}\n`;
     reply += `┣ ☎️ Indicatif: \\+${esc(countryCode)}\n`;
-    reply += `┣ 🔢 Numéro National: ${esc(nationalNum)}\n`;
-    reply += `┗ 📱 Type: ${esc(typeLabels[type] || type)}\n`;
+    reply += `┣ 🔢 Numéro National: \`${esc(nationalNum)}\`\n`;
+    reply += `┣ 📱 Type: ${esc(typeLabels[rawType])}\n`;
+    if (tz) reply += `┣ 🕐 Fuseau: ${esc(tz)}\n`;
+    if (localTime) reply += `┗ 🕰️ Heure Locale: ${esc(localTime)}\n`;
+    reply += '\n';
 
-    if (carrierInfo) reply += `\n🏢 *Opérateur*\n┗ ${esc(carrierInfo)}\n`;
+    // Infos opérateur (AbstractAPI ou fallback)
+    if (abstract) {
+      reply += `📶 *Opérateur \\(AbstractAPI\\)*\n`;
+      if (abstract.carrier)  reply += `┣ 🏢 Opérateur: ${esc(abstract.carrier)}\n`;
+      if (abstract.location) reply += `┣ 📍 Région: ${esc(abstract.location)}\n`;
+      if (abstract.type)     reply += `┗ 📱 Type Ligne: ${esc(abstract.type)}\n`;
+      reply += '\n';
+    } else if (carrierFallback) {
+      reply += `📶 *Opérateur*\n┗ 🏢 ${esc(carrierFallback)}\n\n`;
+    }
+
+    // Liens utiles
+    const waLink = `https://wa.me/${e164Format.replace('+', '')}`;
+    const tgLink = `https://t.me/${e164Format.replace('+', '')}`;
+    reply += `🔗 *Vérifier Sur*\n`;
+    reply += `┣ [💬 WhatsApp](${waLink})\n`;
+    reply += `┗ [✈️ Telegram](${tgLink})`;
 
     await updateMsg(ctx, msg, reply);
 
