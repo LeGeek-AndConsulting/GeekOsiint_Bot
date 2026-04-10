@@ -2,7 +2,8 @@ import { Telegraf } from 'telegraf';
 import { config } from 'dotenv';
 import axios from 'axios';
 import dns from 'dns/promises';
-import { parsePhoneNumber, isValidPhoneNumber, getNumberType } from 'libphonenumber-js';
+import { createHash } from 'crypto';
+import { parsePhoneNumber, isValidPhoneNumber } from 'libphonenumber-js';
 
 config();
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
@@ -135,8 +136,10 @@ async function handleEmail(ctx, email) {
 
   const msg = await loading(ctx, 'Analyse Email...');
 
-  // Parallel: emailrep + HIBP
-  const [repRes, hibpRes] = await Promise.allSettled([
+  const md5 = createHash('md5').update(email.toLowerCase().trim()).digest('hex');
+
+  // Parallel: emailrep + HIBP + Gravatar
+  const [repRes, hibpRes, gravRes] = await Promise.allSettled([
     axios.get(`https://emailrep.io/${encodeURIComponent(email)}`, {
       headers: { 'User-Agent': 'GeekOSINT-Bot' },
       timeout: 8000,
@@ -147,11 +150,15 @@ async function handleEmail(ctx, email) {
           headers: { 'hibp-api-key': process.env.HIBP_API_KEY, 'user-agent': 'GeekOSINT-Bot' },
           timeout: 8000, validateStatus: s => s < 500
         })
-      : Promise.resolve(null)
+      : Promise.resolve(null),
+    axios.get(`https://www.gravatar.com/${md5}.json`, {
+      timeout: 5000, validateStatus: s => s < 500
+    })
   ]);
 
   const rep = repRes.status === 'fulfilled' && repRes.value?.data;
   const hibp = hibpRes.status === 'fulfilled' && hibpRes.value?.data;
+  const grav = gravRes.status === 'fulfilled' && gravRes.value?.data?.entry?.[0];
   const breaches = Array.isArray(hibp) ? hibp : [];
 
   const domain = email.split('@')[1];
@@ -199,7 +206,20 @@ async function handleEmail(ctx, email) {
     reply += `ℹ️ _Clé HIBP Non Configurée — Fuites Non Vérifiées_\n`;
   }
 
-  reply += `\n🌐 *Domaine Email:* \`${esc(domain)}\``;
+  // Gravatar
+  if (grav) {
+    reply += `\n👤 *Identité \\(Gravatar\\)*\n`;
+    if (grav.displayName) reply += `┣ 🪪 Nom: ${esc(grav.displayName)}\n`;
+    if (grav.name?.formatted) reply += `┣ 📛 Nom Complet: ${esc(grav.name.formatted)}\n`;
+    if (grav.name?.givenName)  reply += `┣ 🔤 Prénom: ${esc(grav.name.givenName)}\n`;
+    if (grav.name?.familyName) reply += `┣ 🔤 Nom: ${esc(grav.name.familyName)}\n`;
+    if (grav.currentLocation)  reply += `┣ 📍 Localisation: ${esc(grav.currentLocation)}\n`;
+    if (grav.aboutMe)          reply += `┣ 📝 Bio: ${esc(grav.aboutMe.slice(0, 80))}\n`;
+    if (grav.urls?.length)     reply += `┗ 🔗 Liens: ${grav.urls.slice(0, 3).map(u => esc(u.value)).join(', ')}\n`;
+    reply += '\n';
+  }
+
+  reply += `🌐 *Domaine Email:* \`${esc(domain)}\``;
 
   await updateMsg(ctx, msg, reply);
 }
@@ -481,7 +501,6 @@ async function checkPlatform(platform, username) {
       },
       validateStatus: s => s < 500
     });
-    // Consider found if 200 and not a redirect to homepage
     const found = res.status === 200 &&
       !res.request?.res?.responseUrl?.includes('404') &&
       !res.request?.res?.responseUrl?.includes('not-found');
@@ -491,18 +510,70 @@ async function checkPlatform(platform, username) {
   }
 }
 
+async function fetchGitHubProfile(username) {
+  try {
+    const res = await axios.get(`https://api.github.com/users/${username}`, {
+      timeout: 6000,
+      headers: { 'User-Agent': 'GeekOSINT-Bot', 'Accept': 'application/vnd.github.v3+json' },
+      validateStatus: s => s < 500
+    });
+    return res.status === 200 ? res.data : null;
+  } catch { return null; }
+}
+
+async function fetchRedditProfile(username) {
+  try {
+    const res = await axios.get(`https://www.reddit.com/user/${username}/about.json`, {
+      timeout: 6000,
+      headers: { 'User-Agent': 'GeekOSINT-Bot/1.0' },
+      validateStatus: s => s < 500
+    });
+    return res.status === 200 ? res.data?.data : null;
+  } catch { return null; }
+}
+
 async function handleUsername(ctx, username) {
   if (!username) return ctx.reply('❌ Spécifie Un Username\\. Ex: `/user monpseudo`', { parse_mode: 'MarkdownV2' });
 
   const msg = await ctx.reply(`🔍 Recherche \`${username}\` Sur ${PLATFORMS.length} Plateformes\\.\\.\\.`, { parse_mode: 'MarkdownV2' });
 
   try {
-    const results = await Promise.all(PLATFORMS.map(p => checkPlatform(p, username)));
+    const [results, ghProfile, redditProfile] = await Promise.all([
+      Promise.all(PLATFORMS.map(p => checkPlatform(p, username))),
+      fetchGitHubProfile(username),
+      fetchRedditProfile(username)
+    ]);
+
     const found = results.filter(r => r.found);
     const notFound = results.filter(r => !r.found);
 
     let reply = `👤 *Recherche Username*\n\`${esc(username)}\`\n\n`;
     reply += `📊 *Résultats: ${found.length}/${PLATFORMS.length} Trouvé\\(s\\)*\n\n`;
+
+    // ── Identité GitHub (si trouvé)
+    if (ghProfile) {
+      reply += `🪪 *Identité \\(GitHub\\)*\n`;
+      if (ghProfile.name)       reply += `┣ 📛 Nom: ${esc(ghProfile.name)}\n`;
+      if (ghProfile.bio)        reply += `┣ 📝 Bio: ${esc(ghProfile.bio.slice(0, 80))}\n`;
+      if (ghProfile.company)    reply += `┣ 🏢 Entreprise: ${esc(ghProfile.company)}\n`;
+      if (ghProfile.location)   reply += `┣ 📍 Localisation: ${esc(ghProfile.location)}\n`;
+      if (ghProfile.blog)       reply += `┣ 🌐 Site: ${esc(ghProfile.blog)}\n`;
+      if (ghProfile.twitter_username) reply += `┣ 🐦 Twitter: @${esc(ghProfile.twitter_username)}\n`;
+      if (ghProfile.email)      reply += `┣ 📧 Email: ${esc(ghProfile.email)}\n`;
+      reply += `┣ ⭐ Followers: ${esc(ghProfile.followers)} · Repos: ${esc(ghProfile.public_repos)}\n`;
+      const created = new Date(ghProfile.created_at).toLocaleDateString('fr-FR');
+      reply += `┗ 📅 Membre Depuis: ${esc(created)}\n\n`;
+    }
+
+    // ── Infos Reddit (si trouvé)
+    if (redditProfile) {
+      const karma = (redditProfile.total_karma || 0).toLocaleString('fr-FR');
+      const age = new Date(redditProfile.created_utc * 1000).toLocaleDateString('fr-FR');
+      reply += `🤖 *Infos Reddit*\n`;
+      reply += `┣ 🏆 Karma Total: ${esc(karma)}\n`;
+      reply += `┣ 💬 Karma Comm: ${esc((redditProfile.comment_karma || 0).toLocaleString('fr-FR'))}\n`;
+      reply += `┗ 📅 Membre Depuis: ${esc(age)}\n\n`;
+    }
 
     if (found.length) {
       reply += `✅ *Présent Sur*\n`;
@@ -514,7 +585,6 @@ async function handleUsername(ctx, username) {
 
     if (notFound.length) {
       reply += `❌ *Non Trouvé Sur*\n`;
-      // Group them in a compact list
       reply += notFound.map(p => `${p.cat} ${esc(p.name)}`).join(' · ');
     }
 
